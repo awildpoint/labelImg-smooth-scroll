@@ -154,6 +154,7 @@ class MainWindow(QMainWindow, WindowMixin):
 
         # Create and add combobox for showing unique labels in group
         self.combo_box = ComboBox(self)
+        self.combo_box.cb.setEditable(True)
         list_layout.addWidget(self.combo_box)
 
         # Create and add a widget for showing current label items

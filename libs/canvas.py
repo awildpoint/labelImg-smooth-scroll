@@ -68,6 +68,7 @@ class Canvas(QWidget):
 
         # initialisation for panning
         self.pan_initial_pos = QPoint()
+        self.is_panning = False
 
     def set_drawing_color(self, qcolor):
         self.drawing_line_color = qcolor
@@ -111,6 +112,18 @@ class Canvas(QWidget):
     def mouseMoveEvent(self, ev):
         """Update line with last point and current coordinates."""
         pos = self.transform_pos(ev.pos())
+
+        # Right button drag to pan image.
+        # Keep this branch early and isolated to avoid jitter caused by
+        # hover/highlight/repaint logic mixing with scrolling updates.
+        if self.is_panning and (ev.buttons() & Qt.RightButton):
+                    # 计算全局坐标的差值，避免因控件滚动导致的局部坐标跳变
+                    global_delta = ev.globalPos() - self.pan_initial_pos
+                    
+                    # 发送给 labelImg 处理
+                    self.scrollRequest.emit(global_delta.x(), Qt.Horizontal)
+                    self.scrollRequest.emit(global_delta.y(), Qt.Vertical)
+                    return
 
         # Update coordinates in status bar if image is opened
         window = self.parent().window()
@@ -164,17 +177,6 @@ class Canvas(QWidget):
             self.repaint()
             return
 
-        # Polygon copy moving.
-        if Qt.RightButton & ev.buttons():
-            if self.selected_shape_copy and self.prev_point:
-                self.override_cursor(CURSOR_MOVE)
-                self.bounded_move_shape(self.selected_shape_copy, pos)
-                self.repaint()
-            elif self.selected_shape:
-                self.selected_shape_copy = self.selected_shape.copy()
-                self.repaint()
-            return
-
         # Polygon/Vertex moving.
         if Qt.LeftButton & ev.buttons():
             if self.selected_vertex():
@@ -203,11 +205,9 @@ class Canvas(QWidget):
                 self.parent().window().label_coordinates.setText(
                         'Width: %d, Height: %d / X: %d; Y: %d' % (current_width, current_height, pos.x(), pos.y()))
             else:
-                # pan
-                delta = ev.pos() - self.pan_initial_pos
-                self.scrollRequest.emit(delta.x(), Qt.Horizontal)
-                self.scrollRequest.emit(delta.y(), Qt.Vertical)
-                self.update()
+                # Keep original behavior minimal here; do not trigger pan/update
+                # to avoid mixing left-drag blank-area pan with right-drag pan.
+                pass
             return
 
         # Just hovering over the canvas, 2 possibilities:
@@ -266,24 +266,32 @@ class Canvas(QWidget):
                 self.prev_point = pos
 
                 if selection is None:
-                    # pan
+                    # keep original blank-area behavior lightweight
                     QApplication.setOverrideCursor(QCursor(Qt.OpenHandCursor))
                     self.pan_initial_pos = ev.pos()
 
-        elif ev.button() == Qt.RightButton and self.editing():
-            self.select_shape_point(pos)
-            self.prev_point = pos
+        elif ev.button() == Qt.RightButton:
+                    self.is_panning = True
+                    self.un_highlight()
+                    # 关键：记录全局坐标 (globalPos)
+                    self.pan_initial_pos = ev.globalPos() 
+                    QApplication.setOverrideCursor(QCursor(Qt.OpenHandCursor))
+                    
+                    # 记录按下瞬间滚动条的数值
+                    window = self.parent().window()
+                    self.h_bar_pos_at_press = window.scroll_bars[Qt.Horizontal].value()
+                    self.v_bar_pos_at_press = window.scroll_bars[Qt.Vertical].value()
+                    return
+
         self.update()
 
     def mouseReleaseEvent(self, ev):
         if ev.button() == Qt.RightButton:
-            menu = self.menus[bool(self.selected_shape_copy)]
-            self.restore_cursor()
-            if not menu.exec_(self.mapToGlobal(ev.pos()))\
-               and self.selected_shape_copy:
-                # Cancel the move by deleting the shadow copy.
-                self.selected_shape_copy = None
-                self.repaint()
+            self.is_panning = False
+            QApplication.restoreOverrideCursor()
+            # 释放时不需要额外操作
+            return
+        
         elif ev.button() == Qt.LeftButton and self.selected_shape:
             if self.selected_vertex():
                 self.override_cursor(CURSOR_POINT)
@@ -294,7 +302,6 @@ class Canvas(QWidget):
             if self.drawing():
                 self.handle_drawing(pos)
             else:
-                # pan
                 QApplication.restoreOverrideCursor()
 
     def end_move(self, copy=False):
@@ -617,13 +624,19 @@ class Canvas(QWidget):
             v_delta = delta.y()
 
         mods = ev.modifiers()
-        if int(Qt.ControlModifier) | int(Qt.ShiftModifier) == int(mods) and v_delta:
-            self.lightRequest.emit(v_delta)
-        elif Qt.ControlModifier == int(mods) and v_delta:
+        if int(Qt.ControlModifier | Qt.ShiftModifier) == int(mods) and v_delta:
+                    self.lightRequest.emit(v_delta)
+                    
+        # 2. 修改核心：纯滚轮（无按键）或 Ctrl + 滚轮 = 缩放图片
+        # 这样即使不按 Ctrl，直接滚动轮子也会缩放
+        elif (int(mods) == Qt.NoModifier or int(mods) == Qt.ControlModifier) and v_delta:
             self.zoomRequest.emit(v_delta)
+            
+        # 3. 其他情况（如单独按住 Shift 滚动）：执行原来的平移滚动
         else:
             v_delta and self.scrollRequest.emit(v_delta, Qt.Vertical)
             h_delta and self.scrollRequest.emit(h_delta, Qt.Horizontal)
+            
         ev.accept()
 
     def keyPressEvent(self, ev):

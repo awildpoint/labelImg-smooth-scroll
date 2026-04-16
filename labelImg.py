@@ -77,6 +77,10 @@ class MainWindow(QMainWindow, WindowMixin):
         super(MainWindow, self).__init__()
         self.setWindowTitle(__appname__)
 
+        # 在 MainWindow.__init__ 中初始化
+        self.h_bar_pos_at_press = 0
+        self.v_bar_pos_at_press = 0
+
         # Load setting in the main thread
         self.settings = Settings()
         self.settings.load()
@@ -187,17 +191,18 @@ class MainWindow(QMainWindow, WindowMixin):
         self.canvas = Canvas(parent=self)
         self.canvas.zoomRequest.connect(self.zoom_request)
         self.canvas.lightRequest.connect(self.light_request)
+        self.canvas.scrollRequest.connect(self.scroll_request)
         self.canvas.set_drawing_shape_to_square(settings.get(SETTING_DRAW_SQUARE, False))
 
         scroll = QScrollArea()
         scroll.setWidget(self.canvas)
-        scroll.setWidgetResizable(True)
+        scroll.setWidgetResizable(False)
         self.scroll_bars = {
             Qt.Vertical: scroll.verticalScrollBar(),
             Qt.Horizontal: scroll.horizontalScrollBar()
         }
         self.scroll_area = scroll
-        self.canvas.scrollRequest.connect(self.scroll_request)
+        # self.canvas.scrollRequest.connect(self.scroll_request)
 
         self.canvas.newShape.connect(self.new_shape)
         self.canvas.shapeMoved.connect(self.set_dirty)
@@ -273,7 +278,7 @@ class MainWindow(QMainWindow, WindowMixin):
         create_mode = action(get_str('crtBox'), self.set_create_mode,
                              'w', 'new', get_str('crtBoxDetail'), enabled=False)
         edit_mode = action(get_str('editBox'), self.set_edit_mode,
-                           'Ctrl+J', 'edit', get_str('editBoxDetail'), enabled=False)
+                           'e', 'edit', get_str('editBoxDetail'), enabled=False)
 
         create = action(get_str('crtBox'), self.create_shape,
                         'w', 'new', get_str('crtBoxDetail'), enabled=False)
@@ -993,11 +998,27 @@ class MainWindow(QMainWindow, WindowMixin):
         else:
             # self.canvas.undoLastLine()
             self.canvas.reset_all_lines()
-
+   
     def scroll_request(self, delta, orientation):
-        units = - delta / (8 * 15)
         bar = self.scroll_bars[orientation]
-        bar.setValue(int(bar.value() + bar.singleStep() * units))
+
+        # 判断是否处于右键平移状态
+        if self.canvas.is_panning:
+            # 获取按下瞬间的起始位置
+            base_pos = self.canvas.h_bar_pos_at_press if orientation == Qt.Horizontal else self.canvas.v_bar_pos_at_press
+            # 抓手模式：目标位置 = 起始位置 - 鼠标位移
+            new_value = base_pos - delta 
+        else:
+            # 常规滚轮缩放/滚动逻辑
+            if abs(delta) == 120:
+                units = -delta / (8 * 15)
+                new_value = int(bar.value() + bar.singleStep() * units)
+            else:
+                new_value = bar.value() + delta
+
+        # 限制范围并设置值
+        new_value = max(bar.minimum(), min(bar.maximum(), int(new_value)))
+        bar.setValue(new_value)
 
     def set_zoom(self, value):
         self.actions.fitWidth.setChecked(False)

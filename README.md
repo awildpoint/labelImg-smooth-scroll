@@ -2,7 +2,7 @@
 
 1. 下载.zip源码解压后，在新虚拟环境中安装lxml和pyqt5
 2. 运行labelImg.py即可在中文软件窗口中进行标注工作。
-3. 暂未打包.exe文件
+3. 运行'pip install -e .',可在环境路径下Scripts/labelimg.exe双击启动
 ## Hotkeys
 
 仅对以下三处作出修改。

@@ -1029,8 +1029,20 @@ class MainWindow(QMainWindow, WindowMixin):
         # Convert to int to avoid type errors
         self.zoom_widget.setValue(int(value))
 
+    # def add_zoom(self, increment=10):
+    #     self.set_zoom(self.zoom_widget.value() + increment)
     def add_zoom(self, increment=10):
-        self.set_zoom(self.zoom_widget.value() + increment)
+        # 1. 计算预期的目标缩放百分比
+        proposed_zoom = self.zoom_widget.value() + increment
+        # 2. 获取适应窗口的缩放比例
+        fit_zoom = int(100 * self.scale_fit_window())
+        # 3. 设定下限为窗口缩放比例,50%缩放或适应窗口比例的较大值
+        lower_limit = max(50, fit_zoom)
+
+        if proposed_zoom < lower_limit:
+            proposed_zoom = lower_limit
+        
+        self.set_zoom(proposed_zoom)
 
     def zoom_request(self, delta):
         # get the current scrollbar positions

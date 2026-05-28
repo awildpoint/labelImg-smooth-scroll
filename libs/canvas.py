@@ -29,6 +29,7 @@ class Canvas(QWidget):
     selectionChanged = pyqtSignal(bool)
     shapeMoved = pyqtSignal()
     drawingPolygon = pyqtSignal(bool)
+    shapeAboutToChange = pyqtSignal()  # Emitted BEFORE any shape is added/removed/moved
 
     CREATE, EDIT = list(range(2))
 
@@ -69,6 +70,10 @@ class Canvas(QWidget):
         # initialisation for panning
         self.pan_initial_pos = QPoint()
         self.is_panning = False
+
+        # Undo support: track whether we need to emit shapeAboutToChange
+        # on the first mouse-move during a drag operation
+        self._shape_move_snapshot_pending = False
 
     def set_drawing_color(self, qcolor):
         self.drawing_line_color = qcolor
@@ -179,6 +184,9 @@ class Canvas(QWidget):
 
         # Polygon/Vertex moving.
         if Qt.LeftButton & ev.buttons():
+            if self._shape_move_snapshot_pending:
+                self._shape_move_snapshot_pending = False
+                self.shapeAboutToChange.emit()
             if self.selected_vertex():
                 self.bounded_move_vertex(pos)
                 self.shapeMoved.emit()
@@ -265,6 +273,10 @@ class Canvas(QWidget):
                 selection = self.select_shape_point(pos)
                 self.prev_point = pos
 
+                if selection is not None:
+                    # User clicked a shape/vertex — a drag may follow
+                    self._shape_move_snapshot_pending = True
+
                 if selection is None:
                     # keep original blank-area behavior lightweight
                     QApplication.setOverrideCursor(QCursor(Qt.OpenHandCursor))
@@ -291,13 +303,15 @@ class Canvas(QWidget):
             QApplication.restoreOverrideCursor()
             # 释放时不需要额外操作
             return
-        
+
         elif ev.button() == Qt.LeftButton and self.selected_shape:
+            self._shape_move_snapshot_pending = False
             if self.selected_vertex():
                 self.override_cursor(CURSOR_POINT)
             else:
                 self.override_cursor(CURSOR_GRAB)
         elif ev.button() == Qt.LeftButton:
+            self._shape_move_snapshot_pending = False
             pos = self.transform_pos(ev.pos())
             if self.drawing():
                 self.handle_drawing(pos)
@@ -586,6 +600,7 @@ class Canvas(QWidget):
             self.update()
             return
 
+        self.shapeAboutToChange.emit()  # Notify before adding shape (for undo)
         self.current.close()
         self.shapes.append(self.current)
         self.current = None

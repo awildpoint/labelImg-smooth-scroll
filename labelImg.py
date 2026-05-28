@@ -104,6 +104,10 @@ class MainWindow(QMainWindow, WindowMixin):
         self.cur_img_idx = 0
         self.img_count = len(self.m_img_list)
 
+        # Undo stack for Ctrl+Z: list of action dicts
+        # Each entry: {'type': 'delete_image', 'moves': [(src, dst), ...], 'image_idx': int, 'description': str}
+        self.undo_stack = []
+
         # Whether we need to save or not.
         self.dirty = False
 
@@ -176,6 +180,7 @@ class MainWindow(QMainWindow, WindowMixin):
 
         self.file_list_widget = QListWidget()
         self.file_list_widget.itemDoubleClicked.connect(self.file_item_double_clicked)
+        self.file_list_widget.installEventFilter(self)  # Capture Delete key on file list
         file_list_layout = QVBoxLayout()
         file_list_layout.setContentsMargins(0, 0, 0, 0)
         file_list_layout.addWidget(self.file_list_widget)
@@ -209,6 +214,7 @@ class MainWindow(QMainWindow, WindowMixin):
         self.canvas.shapeMoved.connect(self.set_dirty)
         self.canvas.selectionChanged.connect(self.shape_selection_changed)
         self.canvas.drawingPolygon.connect(self.toggle_drawing_sensitive)
+        self.canvas.shapeAboutToChange.connect(self._on_shape_about_to_change)
 
         self.setCentralWidget(scroll)
         self.addDockWidget(Qt.RightDockWidgetArea, self.dock)
@@ -270,6 +276,8 @@ class MainWindow(QMainWindow, WindowMixin):
         close = action(get_str('closeCur'), self.close_file, 'Ctrl+W', 'close', get_str('closeCurDetail'))
 
         delete_image = action(get_str('deleteImg'), self.delete_image, 'Ctrl+Shift+D', 'close', get_str('deleteImgDetail'))
+
+        undo_action = action(get_str('undoAction'), self.undo_last_action, 'Ctrl+Z', 'undo', get_str('undoActionDetail'))
 
         reset_all = action(get_str('resetAll'), self.reset_all, None, 'resetall', get_str('resetAllDetail'))
 
@@ -388,7 +396,7 @@ class MainWindow(QMainWindow, WindowMixin):
         self.draw_squares_option.triggered.connect(self.toggle_draw_square)
 
         # Store actions for further handling.
-        self.actions = Struct(save=save, save_format=save_format, saveAs=save_as, open=open, close=close, resetAll=reset_all, deleteImg=delete_image,
+        self.actions = Struct(save=save, save_format=save_format, saveAs=save_as, open=open, close=close, resetAll=reset_all, deleteImg=delete_image, undo=undo_action,
                               lineColor=color1, create=create, delete=delete, edit=edit, copy=copy,
                               createMode=create_mode, editMode=edit_mode, advancedMode=advanced_mode,
                               shapeLineColor=shape_line_color, shapeFillColor=shape_fill_color,
@@ -435,7 +443,7 @@ class MainWindow(QMainWindow, WindowMixin):
         self.display_label_option.triggered.connect(self.toggle_paint_labels_option)
 
         add_actions(self.menus.file,
-                    (open, open_dir, change_save_dir, open_annotation, copy_prev_bounding, self.menus.recentFiles, save, save_format, save_as, close, reset_all, delete_image, quit))
+                    (open, open_dir, change_save_dir, open_annotation, copy_prev_bounding, self.menus.recentFiles, save, save_format, save_as, close, reset_all, delete_image, undo_action, quit))
         add_actions(self.menus.help, (help_default, show_info, show_shortcut))
         add_actions(self.menus.view, (
             self.auto_saving,
@@ -555,6 +563,16 @@ class MainWindow(QMainWindow, WindowMixin):
         if event.key() == Qt.Key_Control:
             # Draw rectangle if Ctrl is pressed
             self.canvas.set_drawing_shape_to_square(True)
+        elif event.key() == Qt.Key_Z and event.modifiers() & Qt.ControlModifier:
+            self.undo_last_action()
+
+    def eventFilter(self, obj, event):
+        """Capture Delete key on file list widget to trigger image deletion."""
+        if obj == self.file_list_widget and event.type() == QEvent.KeyPress:
+            if event.key() == Qt.Key_Delete:
+                self.delete_image()
+                return True
+        return super(MainWindow, self).eventFilter(obj, event)
 
     # Support Functions #
     def set_format(self, save_format):
@@ -658,6 +676,7 @@ class MainWindow(QMainWindow, WindowMixin):
         self.canvas.reset_state()
         self.label_coordinates.clear()
         self.combo_box.cb.clear()
+        self.undo_stack.clear()  # Discard undo history when switching images
 
     def current_item(self):
         items = self.label_list.selectedItems()
@@ -765,6 +784,7 @@ class MainWindow(QMainWindow, WindowMixin):
             return
         text = self.label_dialog.pop_up(item.text())
         if text is not None:
+            self._push_shapes_undo('编辑标签')
             item.setText(text)
             item.setBackground(generate_color_by_text(text))
             self.set_dirty()
@@ -926,6 +946,7 @@ class MainWindow(QMainWindow, WindowMixin):
             return False
 
     def copy_selected_shape(self):
+        self._push_shapes_undo('复制标注框')
         self.add_label(self.canvas.copy_selected_shape())
         # fix copy and delete
         self.shape_selection_changed(True)
@@ -1552,19 +1573,174 @@ class MainWindow(QMainWindow, WindowMixin):
         self.canvas.setEnabled(False)
         self.actions.saveAs.setEnabled(False)
 
+    # ── Delete with trash & undo support ──────────────────────────────
+
+    def _find_data_root(self, image_path):
+        """Always go one level up from the directory the user opened.
+        No name matching, no heuristics — purely relative.
+
+        Example: user opens  D:/proj/images/  → trash in  D:/proj/trash/
+                 user opens  D:/proj/manual_images/ → trash in  D:/proj/trash/
+                 user opens  D:/proj/           → trash in  D:/        /trash/
+
+        The last case is unusual (flat project with no subfolder), but
+        the trash is still predictable: one level above wherever you are."""
+        if self.last_open_dir and os.path.isdir(self.last_open_dir):
+            parent = os.path.dirname(os.path.normpath(self.last_open_dir))
+            if parent:
+                return parent
+            return os.path.normpath(self.last_open_dir)
+        return os.path.normpath(os.path.dirname(os.path.abspath(image_path)))
+
+    def _find_label_files(self, image_path):
+        """Return a list of absolute paths to label files that exist for the
+        given image, using the same lookup strategy as show_bounding_box."""
+        basename = os.path.splitext(os.path.basename(image_path))[0]
+        candidates = []
+
+        if self.default_save_dir is not None and os.path.isdir(self.default_save_dir):
+            search_dir = self.default_save_dir
+        else:
+            search_dir = os.path.dirname(image_path)
+
+        for ext in (XML_EXT, TXT_EXT, JSON_EXT):
+            label_path = os.path.join(search_dir, basename + ext)
+            if os.path.isfile(label_path):
+                candidates.append(label_path)
+        return candidates
+
     def delete_image(self):
+        """Move current image and its label files to a trash folder for safe
+        undo, instead of permanently deleting them."""
         delete_path = self.file_path
-        if delete_path is not None:
-            idx = self.cur_img_idx
-            if os.path.exists(delete_path):
-                os.remove(delete_path)
-            self.import_dir_images(self.last_open_dir)
+        if delete_path is None:
+            return
+        if not os.path.exists(delete_path):
+            return
+
+        # Auto-save any unsaved annotation changes so the label file
+        # moved to trash contains the latest edits, and so we don't get
+        # a stray "unsaved changes" dialog after the file is gone.
+        if self.dirty:
+            self.save_file()
+
+        # Locate label files and the trash directory
+        label_files = self._find_label_files(delete_path)
+        data_root = self._find_data_root(delete_path)
+        trash_dir = os.path.normpath(os.path.join(data_root, 'trash'))
+        os.makedirs(trash_dir, exist_ok=True)
+
+        # Build the list of (src → dst) moves
+        moves = []
+        image_basename = os.path.basename(delete_path)
+        trash_image = os.path.join(trash_dir, image_basename)
+        # Avoid overwriting existing files in trash
+        counter = 1
+        base, ext = os.path.splitext(image_basename)
+        while os.path.exists(trash_image):
+            trash_image = os.path.join(trash_dir, '%s_%d%s' % (base, counter, ext))
+            counter += 1
+        moves.append((delete_path, trash_image))
+
+        for lbl in label_files:
+            lbl_basename = os.path.basename(lbl)
+            trash_lbl = os.path.join(trash_dir, lbl_basename)
+            c2 = 1
+            lbl_base, lbl_ext = os.path.splitext(lbl_basename)
+            while os.path.exists(trash_lbl):
+                trash_lbl = os.path.join(trash_dir, '%s_%d%s' % (lbl_base, c2, lbl_ext))
+                c2 += 1
+            moves.append((lbl, trash_lbl))
+
+        # Confirmation dialog
+        file_list = '\n'.join('  %s\n    → %s' % (os.path.basename(s), d) for s, d in moves)
+        msg = (u'将把以下文件移动到 trash 备份文件夹：\n\n'
+               u'trash 目录：%s\n\n'
+               u'%s\n\n'
+               u'确认移动吗？之后可用 Ctrl+Z 撤销。' % (trash_dir, file_list))
+        reply = QMessageBox.question(
+            self, u'确认删除（移动到 trash）', msg,
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+
+        if reply != QMessageBox.Yes:
+            return
+
+        # Execute moves
+        try:
+            for src, dst in moves:
+                shutil.move(src, dst)
+        except Exception as e:
+            QMessageBox.critical(self, u'移动失败',
+                                 u'无法移动文件：%s' % str(e))
+            return
+
+        # Push onto undo stack
+        idx = self.cur_img_idx
+        self.undo_stack.append({
+            'type': 'delete_image',
+            'moves': moves,
+            'image_idx': idx,
+            'description': u'删除 %s' % os.path.basename(delete_path),
+        })
+
+        # Refresh the file list
+        self.import_dir_images(self.last_open_dir)
+        if self.img_count > 0:
+            self.cur_img_idx = min(idx, self.img_count - 1)
+            filename = self.m_img_list[self.cur_img_idx]
+            self.load_file(filename)
+        else:
+            self.close_file()
+
+    def undo_last_action(self):
+        """Undo the most recent action (Ctrl+Z).
+        Unified: handles both file deletions and shape (annotation) changes."""
+        if not self.undo_stack:
+            self.statusBar().showMessage(u'没有可撤销的操作')
+            return
+
+        entry = self.undo_stack.pop()
+
+        if entry['type'] == 'shapes':
+            # Restore shapes to the saved snapshot
+            self._restore_shapes_snapshot(entry['shapes_data'])
+            self.statusBar().showMessage(
+                u'已撤销：%s' % entry.get('description', u'撤销操作'))
+
+        elif entry['type'] == 'delete_image':
+            try:
+                # Move files back from trash in reverse order
+                for src, dst in reversed(entry['moves']):
+                    parent_dir = os.path.dirname(src)
+                    if not os.path.isdir(parent_dir):
+                        os.makedirs(parent_dir, exist_ok=True)
+                    if os.path.exists(dst):
+                        shutil.move(dst, src)
+            except Exception as e:
+                QMessageBox.critical(self, u'撤销失败',
+                                     u'无法恢复文件：%s' % str(e))
+                return
+
+            # Refresh file list and navigate back to the restored image
+            if self.last_open_dir:
+                self.import_dir_images(self.last_open_dir)
             if self.img_count > 0:
-                self.cur_img_idx = min(idx, self.img_count - 1)
-                filename = self.m_img_list[self.cur_img_idx]
-                self.load_file(filename)
-            else:
-                self.close_file()
+                image_path = [s for s, d in entry['moves']
+                              if not s.endswith((XML_EXT, TXT_EXT, JSON_EXT))]
+                if image_path:
+                    try:
+                        new_idx = self.m_img_list.index(image_path[0])
+                        self.cur_img_idx = new_idx
+                        self.load_file(self.m_img_list[new_idx])
+                    except ValueError:
+                        self.cur_img_idx = 0
+                        self.open_next_image()
+                else:
+                    self.cur_img_idx = 0
+                    self.open_next_image()
+
+            self.statusBar().showMessage(
+                u'已撤销：%s' % entry.get('description', u'撤销操作'))
 
     def reset_all(self):
         self.settings.reset()
@@ -1607,7 +1783,70 @@ class MainWindow(QMainWindow, WindowMixin):
             self.canvas.update()
             self.set_dirty()
 
+    # ── Unified shapes undo ────────────────────────────────────────
+
+    def _on_shape_about_to_change(self):
+        """Canvas signal: save snapshot before shape is added/modified/deleted."""
+        self._push_shapes_undo('标注框操作')
+
+    def _save_shapes_snapshot(self):
+        """Return deep copies of all current shapes."""
+        return [s.copy() for s in self.canvas.shapes]
+
+    def _restore_shapes_snapshot(self, shapes_data):
+        """Replace canvas shapes and rebuild the label list.
+        Critical: deselect everything so restored shapes don't appear stuck
+        in a selected (blue) state — Shape.copy() preserves the 'selected'
+        flag and canvas.selected_shape alone won't clear it."""
+        # 1) Properly deselect whatever was selected before the swap.
+        self.canvas.de_select_shape()
+
+        # 2) Clear stale visibility entries belonging to old shape objects.
+        self.canvas.visible.clear()
+
+        # 3) Ensure restored shapes are not painted as selected.
+        for s in shapes_data:
+            s.selected = False
+
+        # 4) Swap in the snapshot.
+        self.canvas.shapes = shapes_data
+        self.canvas.selected_shape = None
+        self.canvas.h_shape = None
+        self.canvas.h_vertex = None
+        self.canvas.set_hiding(False)
+        self.canvas.update()
+
+        # 5) Rebuild label list.
+        self.label_list.clear()
+        self.items_to_shapes.clear()
+        self.shapes_to_items.clear()
+        for shape in shapes_data:
+            item = HashableQListWidgetItem(shape.label)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked)
+            item.setBackground(generate_color_by_text(shape.label))
+            self.items_to_shapes[item] = shape
+            self.shapes_to_items[shape] = item
+            self.label_list.addItem(item)
+
+        # 6) Restore UI affordances.
+        has_shapes = len(shapes_data) > 0
+        for action in self.actions.onShapesPresent:
+            action.setEnabled(has_shapes)
+        self.update_combo_box()
+        self.set_dirty()
+
+    def _push_shapes_undo(self, description):
+        """Push current shapes state onto the undo stack."""
+        snapshot = self._save_shapes_snapshot()
+        self.undo_stack.append({
+            'type': 'shapes',
+            'shapes_data': snapshot,
+            'description': description,
+        })
+
     def delete_selected_shape(self):
+        self._push_shapes_undo('删除标注框')
         self.remove_label(self.canvas.delete_selected())
         self.set_dirty()
         if self.no_shapes():
